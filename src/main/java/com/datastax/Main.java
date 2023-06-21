@@ -16,11 +16,16 @@ import java.util.function.BiFunction;
 
 public class Main {
     private static final int MAX_CONCURRENT_WRITES = 100;
+    private static final int TOP_K = 100;
+
+    private static final String BASE_FVECS_FPATH  = "/sift-data/base.fvecs";
+    private static final String QUERY_FVECS_FPATH = "/sift-data/query.fvecs";
+    private static final String TRUTH_IVECS_FPATH = "/sift-data/groundtruth.ivecs";
 
     private static final CqlSession session = new CqlSessionBuilder().build();
 
     static {
-        Arrays.stream("""
+        var setup = Arrays.stream("""
         CREATE KEYSPACE IF NOT EXISTS testing WITH
             replication = {
                 'class': 'SimpleStrategy',
@@ -38,52 +43,59 @@ public class Main {
         CREATE CUSTOM INDEX IF NOT EXISTS ON sifttest(val) USING 'StorageAttachedIndex';
         
         TRUNCATE sifttest
-        """.split(";")).forEach(session::execute);
+        """.split(";"));
+
+        setup.forEach(session::execute);
     }
 
-    @SuppressWarnings({"DataFlowIssue"})
     public static void main(String[] args) throws Throwable {
-        readFloatVectors("/sift-data/base.fvecs", (vector, i) -> (
-            session.executeAsync("INSERT INTO sifttest (key, val) VALUES (%d, %s)".formatted(i, Arrays.toString(vector))).toCompletableFuture()
+        processFloatVectors(BASE_FVECS_FPATH, (key, vector) -> (
+            session.executeAsync("INSERT INTO sifttest (key, val) VALUES (%d, %s)".formatted(key, Arrays.toString(vector))).toCompletableFuture()
         ));
 
         var topKFound = new AtomicInteger();
         var totalQueries = new AtomicInteger();
-        final var topK = 100;
 
-        try (var dis = new DataInputStream(new BufferedInputStream(Main.class.getResourceAsStream("/sift-data/groundtruth.ivecs")))) {
-            readFloatVectors("/sift-data/query.fvecs", (vector, i) -> {
+        try (var dis = createDISFomResource(TRUTH_IVECS_FPATH)) {
+            processFloatVectors(QUERY_FVECS_FPATH, (key, vector) -> {
                 var vecStr = Arrays.toString(vector);
-                var future = session.executeAsync("SELECT key FROM sifttest ORDER BY val ANN OF %s LIMIT %d".formatted(vecStr, topK)).toCompletableFuture();
+                var future = session.executeAsync("SELECT key FROM sifttest ORDER BY val ANN OF %s LIMIT %d".formatted(vecStr, TOP_K)).toCompletableFuture();
 
-                var gt = readNextIntegerVec(dis);
+                var gt = readNextGroundTruth(dis);
 
                 future.thenAccept((result) -> {
+                    int[] n = { 0 };
+
                     result.currentPage().forEach(row -> {
                         if (gt.contains(row.getInt("key"))) {
-                            topKFound.getAndIncrement();
+                            n[0]++;
                         }
                     });
+
+                    topKFound.addAndGet(n[0]);
                     totalQueries.getAndIncrement();
                 });
 
                 return future;
-            });
+            }).awaitCompletion();
+
+            var recall = topKFound.doubleValue() / (totalQueries.get() * TOP_K);
+
+            System.out.println(recall);
+            assert recall > .975;
+
+            session.close();
         }
-
-        var recall = topKFound.doubleValue() / (totalQueries.get() * topK);
-
-        System.out.println(recall);
-        assert recall > .975;
     }
 
-    @SuppressWarnings({"DataFlowIssue", "ResultOfMethodCallIgnored"})
-    private static <T> void readFloatVectors(String filePath, BiFunction<float[], Integer, CompletableFuture<T>> fn) throws IOException, InterruptedException {
+    @SuppressWarnings({"ResultOfMethodCallIgnored"})
+    private static Awaitable processFloatVectors(String filePath, AsyncVectorConsumer fn) throws IOException, InterruptedException {
         Semaphore semaphore = new Semaphore(MAX_CONCURRENT_WRITES);
-        BlockingQueue<CompletableFuture<T>> futures = new LinkedBlockingQueue<>(MAX_CONCURRENT_WRITES);
-        var idx = 0;
+        BlockingQueue<CompletableFuture<?>> futures = new LinkedBlockingQueue<>(MAX_CONCURRENT_WRITES);
 
-        try (var dis = new DataInputStream(new BufferedInputStream(Main.class.getResourceAsStream(filePath)))) {
+        var key = 0;
+
+        try (var dis = createDISFomResource(filePath)) {
             while (dis.available() > 0) {
                 var dimension = Integer.reverseBytes(dis.readInt());
                 var buffer = ByteBuffer.allocate(dimension * Float.BYTES).order(ByteOrder.LITTLE_ENDIAN);
@@ -98,7 +110,7 @@ public class Main {
 
                 semaphore.acquire();
 
-                CompletableFuture<T> future = fn.apply(vector, idx++);
+                CompletableFuture<?> future = fn.apply(key++, vector);
                 futures.offer(future);
 
                 future.whenComplete((result, ex) -> {
@@ -107,13 +119,11 @@ public class Main {
                 });
             }
 
-            futures
-                .parallelStream()
-                .forEach(CompletableFuture::join);
+            return () -> futures.parallelStream().forEach(CompletableFuture::join);
         }
     }
 
-    private static HashSet<Integer> readNextIntegerVec(DataInputStream dis) {
+    private static HashSet<Integer> readNextGroundTruth(DataInputStream dis) {
         try {
             var numNeighbors = Integer.reverseBytes(dis.readInt());
             var groundTruth = new HashSet<Integer>(numNeighbors);
@@ -127,4 +137,15 @@ public class Main {
             throw new RuntimeException(e);
         }
     }
+
+    @SuppressWarnings("DataFlowIssue")
+    private static DataInputStream createDISFomResource(String path) {
+        return new DataInputStream(new BufferedInputStream(Main.class.getResourceAsStream(path)));
+    }
 }
+
+interface Awaitable {
+    void awaitCompletion();
+}
+
+interface AsyncVectorConsumer extends BiFunction<Integer, float[], CompletableFuture<?>> {}
