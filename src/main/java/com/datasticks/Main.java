@@ -2,6 +2,7 @@ package com.datasticks;
 
 import com.datastax.oss.driver.api.core.CqlSession;
 import com.datastax.oss.driver.api.core.CqlSessionBuilder;
+import com.datastax.oss.driver.api.core.cql.AsyncResultSet;
 
 import java.io.BufferedInputStream;
 import java.io.DataInputStream;
@@ -49,7 +50,7 @@ public class Main {
 
     public static void main(String[] args) throws Throwable {
         processFloatVectorsAsync(BASE_FVECS_FPATH, (key, vector) -> (
-            session.executeAsync("INSERT INTO sifttest (key, val) VALUES (%d, %s)".formatted(key, Arrays.toString(vector))).toCompletableFuture()
+            executeAsync("INSERT INTO sifttest (key, val) VALUES (%d, %s)", key, Arrays.toString(vector))
         ));
 
         var topKFound = new AtomicInteger();
@@ -58,7 +59,7 @@ public class Main {
         try (var dis = createDISFomResource(TRUTH_IVECS_FPATH)) {
             processFloatVectorsAsync(QUERY_FVECS_FPATH, (key, vector) -> {
                 var vecStr = Arrays.toString(vector);
-                var future = session.executeAsync("SELECT key FROM sifttest ORDER BY val ANN OF %s LIMIT %d".formatted(vecStr, TOP_K)).toCompletableFuture();
+                var future = executeAsync("SELECT key FROM sifttest ORDER BY val ANN OF %s LIMIT %d", vecStr, TOP_K);
 
                 var gt = readNextGroundTruth(dis);
 
@@ -82,36 +83,45 @@ public class Main {
 
             System.out.println(recall);
             assert recall > .975;
-
+        } finally {
             session.close();
         }
     }
 
-    @SuppressWarnings({"ResultOfMethodCallIgnored", "CodeBlock2Expr"})
-    private static Awaitable processFloatVectorsAsync(String filePath, AsyncVectorConsumer fn) throws IOException {
-        BlockingQueue<CompletableFuture<?>> futures = new ArrayBlockingQueue<>(MAX_CONCURRENT_WRITES);
+    private static Awaitable processFloatVectorsAsync(String filePath, AsyncVectorConsumer fn) throws IOException, InterruptedException {
+        var futures = new ConcurrentLinkedQueue<CompletableFuture<?>>();
+        var semaphore = new Semaphore(MAX_CONCURRENT_WRITES);
+
         var key = 0;
 
         try (var dis = createDISFomResource(filePath)) {
             while (dis.available() > 0) {
-                var dimension = Integer.reverseBytes(dis.readInt());
-                var buffer = ByteBuffer.allocate(dimension * Float.BYTES).order(ByteOrder.LITTLE_ENDIAN);
+                var vector = readFloatNextVector(dis);
 
-                dis.readFully(buffer.array());
-
-                var vector = new float[dimension];
-                buffer.asFloatBuffer().get(vector);
-
+                semaphore.acquire();
                 CompletableFuture<?> future = fn.apply(key++, vector);
                 futures.offer(future);
 
                 future.whenComplete((result, ex) -> {
-                    futures.poll();
+                    futures.remove(future);
+                    semaphore.release();
                 });
             }
         }
 
         return () -> futures.parallelStream().forEach(CompletableFuture::join);
+    }
+
+    private static float[] readFloatNextVector(DataInputStream dis) throws IOException {
+        var dimension = Integer.reverseBytes(dis.readInt());
+        var buffer = ByteBuffer.allocate(dimension * Float.BYTES).order(ByteOrder.LITTLE_ENDIAN);
+
+        dis.readFully(buffer.array());
+
+        var vector = new float[dimension];
+        buffer.asFloatBuffer().get(vector);
+
+        return vector;
     }
 
     private static HashSet<Integer> readNextGroundTruth(DataInputStream dis) {
@@ -127,6 +137,10 @@ public class Main {
         } catch (IOException e) {
             throw new RuntimeException(e);
         }
+    }
+
+    private static CompletableFuture<AsyncResultSet> executeAsync(String query, Object ...bindings) {
+        return session.executeAsync(query.formatted(bindings)).toCompletableFuture();
     }
 
     @SuppressWarnings("DataFlowIssue")
