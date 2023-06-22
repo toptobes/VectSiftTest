@@ -1,4 +1,4 @@
-package com.datastax;
+package com.datasticks;
 
 import com.datastax.oss.driver.api.core.CqlSession;
 import com.datastax.oss.driver.api.core.CqlSessionBuilder;
@@ -12,7 +12,6 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.BiFunction;
 
 public class Main {
     private static final int MAX_CONCURRENT_WRITES = 100;
@@ -101,10 +100,7 @@ public class Main {
                 dis.readFully(buffer.array());
 
                 var vector = new float[dimension];
-
-                for (int i = 0; i < dimension; i++) {
-                    vector[i] = buffer.getFloat();
-                }
+                buffer.asFloatBuffer().get(vector);
 
                 CompletableFuture<?> future = fn.apply(key++, vector);
                 futures.offer(future);
@@ -113,9 +109,9 @@ public class Main {
                     futures.poll();
                 });
             }
-
-            return () -> futures.parallelStream().forEach(CompletableFuture::join);
         }
+
+        return () -> futures.parallelStream().forEach(CompletableFuture::join);
     }
 
     private static HashSet<Integer> readNextGroundTruth(DataInputStream dis) {

@@ -1,4 +1,4 @@
-package com.datastax;
+package com.datasticks;
 
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BiFunction;
