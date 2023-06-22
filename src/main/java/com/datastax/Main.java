@@ -25,7 +25,7 @@ public class Main {
     private static final CqlSession session = new CqlSessionBuilder().build();
 
     static {
-        var setup = Arrays.stream("""
+        Arrays.stream("""
         CREATE KEYSPACE IF NOT EXISTS testing WITH
             replication = {
                 'class': 'SimpleStrategy',
@@ -42,14 +42,14 @@ public class Main {
         
         CREATE CUSTOM INDEX IF NOT EXISTS ON sifttest(val) USING 'StorageAttachedIndex';
         
-        TRUNCATE sifttest
-        """.split(";"));
-
-        setup.forEach(session::execute);
+        TRUNCATE sifttest;
+        """.split(";"))
+           .filter(s -> !s.isBlank())
+           .forEach(session::execute);
     }
 
     public static void main(String[] args) throws Throwable {
-        processFloatVectors(BASE_FVECS_FPATH, (key, vector) -> (
+        processFloatVectorsAsync(BASE_FVECS_FPATH, (key, vector) -> (
             session.executeAsync("INSERT INTO sifttest (key, val) VALUES (%d, %s)".formatted(key, Arrays.toString(vector))).toCompletableFuture()
         ));
 
@@ -57,7 +57,7 @@ public class Main {
         var totalQueries = new AtomicInteger();
 
         try (var dis = createDISFomResource(TRUTH_IVECS_FPATH)) {
-            processFloatVectors(QUERY_FVECS_FPATH, (key, vector) -> {
+            processFloatVectorsAsync(QUERY_FVECS_FPATH, (key, vector) -> {
                 var vecStr = Arrays.toString(vector);
                 var future = session.executeAsync("SELECT key FROM sifttest ORDER BY val ANN OF %s LIMIT %d".formatted(vecStr, TOP_K)).toCompletableFuture();
 
@@ -88,11 +88,9 @@ public class Main {
         }
     }
 
-    @SuppressWarnings({"ResultOfMethodCallIgnored"})
-    private static Awaitable processFloatVectors(String filePath, AsyncVectorConsumer fn) throws IOException, InterruptedException {
-        Semaphore semaphore = new Semaphore(MAX_CONCURRENT_WRITES);
-        BlockingQueue<CompletableFuture<?>> futures = new LinkedBlockingQueue<>(MAX_CONCURRENT_WRITES);
-
+    @SuppressWarnings({"ResultOfMethodCallIgnored", "CodeBlock2Expr"})
+    private static Awaitable processFloatVectorsAsync(String filePath, AsyncVectorConsumer fn) throws IOException {
+        BlockingQueue<CompletableFuture<?>> futures = new ArrayBlockingQueue<>(MAX_CONCURRENT_WRITES);
         var key = 0;
 
         try (var dis = createDISFomResource(filePath)) {
@@ -108,14 +106,11 @@ public class Main {
                     vector[i] = buffer.getFloat();
                 }
 
-                semaphore.acquire();
-
                 CompletableFuture<?> future = fn.apply(key++, vector);
                 futures.offer(future);
 
                 future.whenComplete((result, ex) -> {
                     futures.poll();
-                    semaphore.release();
                 });
             }
 
@@ -143,9 +138,3 @@ public class Main {
         return new DataInputStream(new BufferedInputStream(Main.class.getResourceAsStream(path)));
     }
 }
-
-interface Awaitable {
-    void awaitCompletion();
-}
-
-interface AsyncVectorConsumer extends BiFunction<Integer, float[], CompletableFuture<?>> {}
